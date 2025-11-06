@@ -1,0 +1,8 @@
+# Log de ejemplo 3: Todas comprometidas
+<START T1>
+<START T2>
+<T1, A, 5, 15>
+<T2, B, 25, 35>
+<COMMIT T1>
+<COMMIT T2>
+<CRASH>

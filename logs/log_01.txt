@@ -1,0 +1,7 @@
+<START T1>
+<START T2>
+<T1, A, 100, 200>
+<T2, B, 50, 70>
+<COMMIT T1>
+<T2, C, 20, 30>
+<CRASH>
