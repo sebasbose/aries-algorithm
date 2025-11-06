@@ -6,237 +6,182 @@ Autor: Sebastián Bolaños Serrano
 Fecha: 06 de Noviembre 2025
 """
 
-import re
 import os
 import sys
-from typing import List, Dict, Tuple, Set
-from dataclasses import dataclass
-from enum import Enum
-import time
-
-
-class OperationType(Enum):
-    START = "START"
-    WRITE = "WRITE"
-    COMMIT = "COMMIT"
-    ABORT = "ABORT"
-    CHECKPOINT = "CHECKPOINT"
-    CRASH = "CRASH"
-
-
-@dataclass
-class LogEntry:
-    """Representa una entrada en el log"""
-    lsn: int  # Log Sequence Number
-    timestamp: int
-    transaction_id: str
-    operation: OperationType
-    page: str = None
-    old_value: int = None
-    new_value: int = None
-
-    def __str__(self):
-        if self.operation == OperationType.WRITE:
-            return f"LSN:{self.lsn} T{self.timestamp} <{self.transaction_id}, {self.page}, {self.old_value}, {self.new_value}>"
-        elif self.operation in [OperationType.START, OperationType.COMMIT, OperationType.ABORT]:
-            return f"LSN:{self.lsn} T{self.timestamp} <{self.operation.value} {self.transaction_id}>"
-        else:
-            return f"LSN:{self.lsn} T{self.timestamp} <{self.operation.value}>"
-
-
-class Database:
-    """Simula una base de datos con páginas"""
-    def __init__(self):
-        self.pages: Dict[str, int] = {}
-        self.dirty_pages: Set[str] = set()
-    
-    def write(self, page: str, value: int):
-        self.pages[page] = value
-        self.dirty_pages.add(page)
-    
-    def read(self, page: str) -> int:
-        return self.pages.get(page, 0)
-    
-    def initialize_page(self, page: str, value: int):
-        if page not in self.pages:
-            self.pages[page] = value
-
 
 class ARIESRecovery:
-    """Implementación del algoritmo ARIES"""
-    
     def __init__(self):
-        self.log: List[LogEntry] = []
-        self.database = Database()
-        self.transaction_table: Dict[str, Dict] = {}
-        self.dirty_page_table: Dict[str, int] = {}
-        self.lsn_counter = 0
-        self.crash_point = -1
-        
-    def parse_log_file(self, filename: str) -> List[LogEntry]:
-        """Lee y parsea el archivo de log"""
+        self.log = []
+        self.pages = {}
+        self.active_txns = set()
+        self.committed_txns = set()
+        self.stats = {
+            'total_operations': 0,
+            'write_operations': 0,
+            'undo_operations': 0,
+            'pages_affected': set(),
+            'initial_state': {},
+            'crash_detected': False
+        }
+    
+    def parse_log(self, filename):
         entries = []
-        lsn = 0
-        
         with open(filename, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-                
-                entry = self._parse_log_line(line, lsn)
-                if entry:
-                    entries.append(entry)
-                    lsn += 1
-                    
-                    if entry.operation == OperationType.CRASH:
-                        self.crash_point = lsn - 1
-                        break
-        
+                entries.append(line)
+                self.stats['total_operations'] += 1
+                if 'CRASH' in line.upper():
+                    self.stats['crash_detected'] = True
+                    break
         return entries
     
-    def _parse_log_line(self, line: str, lsn: int) -> LogEntry:
-        """Parsea una línea del log"""
-        line = line.strip('<>')
+    def analysis(self):
+        # Find active and committed transactions
+        for line in self.log:
+            if 'START' in line:
+                tid = line.split()[1].rstrip('>')
+                self.active_txns.add(tid)
+            elif 'COMMIT' in line:
+                tid = line.split()[1].rstrip('>')
+                self.committed_txns.add(tid)
+                if tid in self.active_txns:
+                    self.active_txns.remove(tid)
+            elif 'WRITE' in line or ',' in line:
+                # Parse write operation
+                parts = line.strip('<>').split(',')
+                if len(parts) >= 4:
+                    tid = parts[0].strip()
+                    page = parts[1].strip()
+                    old_val = int(parts[2].strip())
+                    new_val = int(parts[3].strip())
+                    self.stats['write_operations'] += 1
+                    self.stats['pages_affected'].add(page)
+                    if page not in self.pages:
+                        self.pages[page] = old_val
+                        self.stats['initial_state'][page] = old_val
         
-        # CRASH
-        if 'CRASH' in line.upper():
-            return LogEntry(lsn, lsn, None, OperationType.CRASH)
-        
-        # START
-        match = re.match(r'START\s+(\w+)', line, re.IGNORECASE)
-        if match:
-            tid = match.group(1)
-            return LogEntry(lsn, lsn, tid, OperationType.START)
-        
-        # COMMIT
-        match = re.match(r'COMMIT\s+(\w+)', line, re.IGNORECASE)
-        if match:
-            tid = match.group(1)
-            return LogEntry(lsn, lsn, tid, OperationType.COMMIT)
-        
-        # ABORT
-        match = re.match(r'ABORT\s+(\w+)', line, re.IGNORECASE)
-        if match:
-            tid = match.group(1)
-            return LogEntry(lsn, lsn, tid, OperationType.ABORT)
-        
-        # WRITE: <T1, A, 100, 200>
-        match = re.match(r'(\w+),\s*(\w+),\s*(\d+),\s*(\d+)', line)
-        if match:
-            tid = match.group(1)
-            page = match.group(2)
-            old_val = int(match.group(3))
-            new_val = int(match.group(4))
-            return LogEntry(lsn, lsn, tid, OperationType.WRITE, page, old_val, new_val)
-        
-        return None
+        losers = self.active_txns - self.committed_txns
+        return self.committed_txns, losers
     
-    def analysis_phase(self) -> Tuple[Set[str], Set[str]]:
-        """
-        Fase 1: ANÁLISIS
-        Identifica transacciones activas y páginas sucias al momento del crash
-        """
-        active_transactions = set()
-        committed_transactions = set()
-        self.transaction_table.clear()
-        self.dirty_page_table.clear()
-        
-        for entry in self.log:
-            if entry.operation == OperationType.CRASH:
-                break
-            
-            if entry.operation == OperationType.START:
-                active_transactions.add(entry.transaction_id)
-                self.transaction_table[entry.transaction_id] = {
-                    'status': 'active',
-                    'lastLSN': entry.lsn
-                }
-            
-            elif entry.operation == OperationType.WRITE:
-                if entry.page not in self.dirty_page_table:
-                    self.dirty_page_table[entry.page] = entry.lsn
-                
-                self.database.initialize_page(entry.page, entry.old_value)
-                
-                if entry.transaction_id in self.transaction_table:
-                    self.transaction_table[entry.transaction_id]['lastLSN'] = entry.lsn
-            
-            elif entry.operation == OperationType.COMMIT:
-                if entry.transaction_id in active_transactions:
-                    active_transactions.remove(entry.transaction_id)
-                    committed_transactions.add(entry.transaction_id)
-                    self.transaction_table[entry.transaction_id]['status'] = 'committed'
-            
-            elif entry.operation == OperationType.ABORT:
-                if entry.transaction_id in active_transactions:
-                    active_transactions.remove(entry.transaction_id)
-                    self.transaction_table[entry.transaction_id]['status'] = 'aborted'
-        
-        losers = active_transactions - committed_transactions
-        
-        return committed_transactions, losers
+    def redo(self):
+        # Redo all operations
+        for line in self.log:
+            if 'WRITE' in line or (',' in line and '<' in line):
+                parts = line.strip('<>').split(',')
+                if len(parts) >= 4:
+                    page = parts[1].strip()
+                    new_val = int(parts[3].strip())
+                    self.pages[page] = new_val
     
-    def redo_phase(self):
-        """
-        Fase 2: REDO
-        Repite todas las operaciones de escritura desde el checkpoint
-        """
-        for entry in self.log:
-            if entry.operation == OperationType.CRASH:
-                break
-            
-            if entry.operation == OperationType.WRITE:
-                self.database.write(entry.page, entry.new_value)
-    
-    def undo_phase(self, losers: Set[str]):
-        """
-        Fase 3: UNDO
-        Deshace todas las operaciones de transacciones no comprometidas
-        """
-        if not losers:
-            return
+    def undo(self, losers):
+        # Undo operations from loser transactions
+        undo_ops = []
+        for line in reversed(self.log):
+            if 'WRITE' in line or (',' in line and '<' in line):
+                parts = line.strip('<>').split(',')
+                if len(parts) >= 4:
+                    tid = parts[0].strip()
+                    if tid in losers:
+                        page = parts[1].strip()
+                        old_val = int(parts[2].strip())
+                        undo_ops.append((page, old_val))
+                        self.stats['undo_operations'] += 1
         
-        undo_operations = []
-        for entry in reversed(self.log):
-            if entry.operation == OperationType.CRASH:
-                continue
-            if entry.operation == OperationType.WRITE and entry.transaction_id in losers:
-                undo_operations.append(entry)
-        
-        for entry in undo_operations:
-            self.database.write(entry.page, entry.old_value)
+        for page, old_val in undo_ops:
+            self.pages[page] = old_val
     
-    def recover(self, log_file: str):
-        """Ejecuta el proceso completo de recuperación ARIES"""
+    
+    def generar_conclusiones(self, winners, losers):
+        print("\n" + "="*50)
+        print("ARIES PROCESS CONCLUSIONS")
+        print("="*50)
+        
+        # Transaction analysis
+        print(f"\nTRANSACTIONS:")
+        print(f"  - Winner transactions (committed): {len(winners)}")
+        if winners:
+            print(f"    Transactions: {', '.join(sorted(winners))}")
+        print(f"  - Loser transactions (aborted): {len(losers)}")
+        if losers:
+            print(f"    Transactions: {', '.join(sorted(losers))}")
+        
+        # Operation statistics
+        print(f"\nOPERATION STATISTICS:")
+        print(f"  - Total operations in log: {self.stats['total_operations']}")
+        print(f"  - Write operations: {self.stats['write_operations']}")
+        print(f"  - UNDO operations applied: {self.stats['undo_operations']}")
+        print(f"  - Pages affected: {len(self.stats['pages_affected'])}")
+        if self.stats['pages_affected']:
+            print(f"    Pages: {', '.join(sorted(self.stats['pages_affected']))}")
+        
+        # State analysis
+        print(f"\nSTATE ANALYSIS:")
+        print("  Initial vs final state:")
+        for page in sorted(self.pages.keys()):
+            inicial = self.stats['initial_state'].get(page, 0)
+            final = self.pages[page]
+            cambio = "✓" if inicial != final else "="
+            print(f"    {page}: {inicial} -> {final} [{cambio}]")
+        
+        # Performance and optimization
+        print(f"\nPERFORMANCE:")
+        eficiencia = ((self.stats['write_operations'] - self.stats['undo_operations']) / 
+                     max(self.stats['write_operations'], 1)) * 100
+        print(f"  - Process efficiency: {eficiencia:.1f}%")
+        print(f"  - Crash detected: {'Yes' if self.stats['crash_detected'] else 'No'}")
+        
+        if self.stats['undo_operations'] > 0:
+            print(f"  - UNDO overhead: {self.stats['undo_operations']} operations reverted")
+        else:
+            print("  - No UNDO overhead (all transactions committed)")
+        
+        print(f"\nOPTIMIZATION:")
+        if len(losers) > len(winners):
+            print("  - RECOMMENDATION: Many loser transactions detected")
+            print("    Consider improving transaction handling to reduce rollbacks")
+        elif self.stats['undo_operations'] == 0:
+            print("  - OPTIMAL: No UNDO operations required")
+        else:
+            print("  - ACCEPTABLE: Standard recovery process executed")
+
+    def recover(self, log_file):
         print(f"\n{os.path.basename(log_file)}")
         print("=" * 50)
         
-        self.log = self.parse_log_file(log_file)
+        self.log = self.parse_log(log_file)
+        winners, losers = self.analysis()
+        self.redo()
+        self.undo(losers)
         
-        winners, losers = self.analysis_phase()
-        self.redo_phase()
-        self.undo_phase(losers)
+        print("\nLog content:")
+        for i, line in enumerate(self.log):
+            print(f"  [{i}] {line}")
         
-        print("\nEstado final:")
-        for page in sorted(self.database.pages.keys()):
-            print(f"  {page} = {self.database.pages[page]}")
+        print("\nFinal state:")
+        for page in sorted(self.pages.keys()):
+            print(f"  {page} = {self.pages[page]}")
         
-        return self.database.pages
+        # Generate conclusions
+        self.generar_conclusiones(winners, losers)
+        
+        return self.pages
 
 
 if __name__ == "__main__":
-    print("SIMULADOR DEL ALGORITMO ARIES")
+    print("ARIES Simulator")
     print("=" * 50)
     
     if len(sys.argv) < 2:
-        print("Uso: python aries.py <archivo_log.txt>")
+        print("Usage: python aries.py <log_file.txt>")
         sys.exit(1)
     
     log_file = sys.argv[1]
     
     if not os.path.exists(log_file):
-        print(f"Error: El archivo '{log_file}' no existe")
+        print(f"Error: File '{log_file}' does not exist")
         sys.exit(1)
     
     recovery = ARIESRecovery()
